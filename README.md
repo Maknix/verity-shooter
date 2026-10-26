@@ -1,3 +1,5 @@
+vibecoding test pls ignore this repository
+
 # Verity Shooter
 
 Vanilla JS + HTML/CSS + three.js (r160) + cannon-es physics. No Node.js / build step.
