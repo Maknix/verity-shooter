@@ -9,14 +9,16 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
    ==================================================================== */
 
 export const TUNE = {
-  scale: 0.55,                                  // model scale (the .glb is ~0.95 units long)
-  hip: new THREE.Vector3(0.19, -0.2, -0.42),    // grip position in camera space (hip fire)
-  adsTopOffset: -0.03,                          // where the gun's top edge sits while aiming
-  adsZ: -0.36,
-  sprintPos: new THREE.Vector3(0.02, -0.12, 0.03),
+  scale: 0.62,                                  // model scale (the .glb is ~1.19 units long -> ~0.74 m)
+  viewFov: 37,                                  // viewmodel FOV: independent of (and lower than) the world camera FOV
+  hip: new THREE.Vector3(0.10, -0.13, -0.45),    // grip position in camera space (hip fire)
+  adsDrop: 0.000,                               // ADS fine-tune: lowers the gun this many metres so the sights sit on the screen centre
+  adsRelief: 0.2,                               // distance from eye to the rear aperture while aiming (metres)
+  sprintPos: new THREE.Vector3(0.02, -0.07, 0.03),
   sprintRot: new THREE.Euler(-0.3, 0.75, 0.14),
   fireRate: 11,                                 // rounds / second
   magSize: 30,
+  reserveStart: 120,                            // spare rounds you start with (buy more at the supply station)
   reloadTime: 2.1,
   glove: 0x2b2e35, sleeve: 0x3c4a60, cuff: 0xffb81c,
 };
@@ -26,6 +28,7 @@ const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const rnd = (a, b) => a + Math.random() * (b - a);
 const Y = new THREE.Vector3(0, 1, 0);
+const _e = new THREE.Euler(), _qBase = new THREE.Quaternion();
 
 /** damped spring for one scalar */
 class Spring {
@@ -52,6 +55,78 @@ function starTexture() {
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
 
+
+/* ====================================================================
+   Verity-A shaders (ported from the Claude Design file):
+   - rainbow_anodized parts: hue-cycling colour + travelling emissive pulse
+   - glowing pulse lines: bright hue-shifting energy running along the gun
+   Patterns use model-space positions baked into an `aLp` vertex attribute,
+   so they stay glued to the gun instead of swimming while you move.
+   ==================================================================== */
+const HUE_GLSL = `
+uniform float uT; varying vec3 vWp;
+vec3 hueRot(vec3 c, float a){ const vec3 k=vec3(0.57735); float ca=cos(a), sa=sin(a); return c*ca + cross(k,c)*sa + k*dot(k,c)*(1.0-ca); }`;
+function patchMat(m, kind, uT) {
+  if (m.userData.verityPatched) return;
+  m.userData.verityPatched = true;
+  m.onBeforeCompile = (s) => {
+    s.uniforms.uT = uT;
+    s.vertexShader = 'attribute vec3 aLp;\nvarying vec3 vWp;\n' + s.vertexShader.replace('#include <project_vertex>', '#include <project_vertex>\n vWp = aLp;');
+    s.fragmentShader = s.fragmentShader.replace('#include <common>', '#include <common>\n' + HUE_GLSL + '\n');
+    if (kind === 'rainbow') {
+      s.fragmentShader = s.fragmentShader
+        .replace('#include <color_fragment>', '#include <color_fragment>\n diffuseColor.rgb = hueRot(diffuseColor.rgb, uT*1.3 + vWp.x*9.0 - vWp.y*6.0);')
+        .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n totalEmissiveRadiance += diffuseColor.rgb * (0.12 + 0.38*pow(0.5+0.5*sin(vWp.x*38.0 - uT*4.0),3.0));');
+    } else {
+      s.fragmentShader = s.fragmentShader.replace('#include <color_fragment>',
+        '#include <color_fragment>\n float ph = vWp.x*48.0 - vWp.y*22.0 - uT*5.0; float pl = pow(0.5+0.5*sin(ph),5.0);\n diffuseColor.rgb = hueRot(diffuseColor.rgb, uT*0.9 + vWp.x*7.0) * (0.3 + 2.2*pl) + vec3(0.9)*pl*pl*0.5;');
+    }
+  };
+  m.customProgramCacheKey = () => 'verity-' + kind;
+  m.needsUpdate = true;
+}
+/** bake model-space positions (relative to the Verity_A node) into an `aLp` attribute */
+function bakeLocalPos(mesh, rel) {
+  const g = mesh.geometry.clone(), P = g.attributes.position, a = new Float32Array(P.count * 3), v = new THREE.Vector3();
+  for (let i = 0; i < P.count; i++) { v.fromBufferAttribute(P, i).applyMatrix4(rel); a[i * 3] = v.x; a[i * 3 + 1] = v.y; a[i * 3 + 2] = v.z; }
+  g.setAttribute('aLp', new THREE.BufferAttribute(a, 3)); mesh.geometry = g;
+}
+const _hc = new THREE.Color();
+const hueCol = (c, t) => c.setHSL(0.83 * clamp(t, 0, 1), 0.95, 0.56);
+
+/** the pulsing glow lines (these are not in the .glb, so they are built here). Returns [{mesh, mag}] in Verity_A space. */
+function buildGlowLines(uT) {
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, toneMapped: false, fog: false });
+  mat.name = 'glow_pulse_line'; patchMat(mat, 'glow', uT);
+  const out = [], PI = Math.PI, v3 = (x, y, z) => new THREE.Vector3(x, y, z);
+  const tube = (curve, r, seg = 80) => new THREE.TubeGeometry(curve, seg, r, 8, false);
+  const gl = (geo, name, pos = [0, 0, 0], rot = [0, 0, 0], mag = false) => {
+    const m = new THREE.Mesh(geo, mat); m.name = name; m.position.set(...pos); m.rotation.set(...rot); m.updateMatrix(); m.frustumCulled = false;
+    const P = geo.attributes.position, col = new Float32Array(P.count * 3), lp = new Float32Array(P.count * 3), v = new THREE.Vector3();
+    for (let i = 0; i < P.count; i++) {
+      v.fromBufferAttribute(P, i).applyMatrix4(m.matrix); hueCol(_hc, (v.x + 0.45) / 1.2);
+      col[i * 3] = _hc.r; col[i * 3 + 1] = _hc.g; col[i * 3 + 2] = _hc.b; lp[i * 3] = v.x; lp[i * 3 + 1] = v.y; lp[i * 3 + 2] = v.z;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3)); geo.setAttribute('aLp', new THREE.BufferAttribute(lp, 3));
+    out.push({ mesh: m, mag });
+  };
+  [1, -1].forEach(z => {
+    const s = z > 0 ? 'R' : 'L';
+    gl(tube(new THREE.LineCurve3(v3(-0.15, -0.0245, z * 0.0262), v3(0.17, -0.0245, z * 0.0262)), 0.0011, 40), 'glow_receiver_' + s);
+    gl(tube(new THREE.LineCurve3(v3(0.225, -0.0225, z * 0.0262), v3(0.41, -0.0225, z * 0.0262)), 0.0011, 40), 'glow_handguard_' + s);
+    gl(tube(new THREE.QuadraticBezierCurve3(v3(-0.18, 0.011, z * 0.0235), v3(-0.3, 0.002, z * 0.0235), v3(-0.43, -0.014, z * 0.0235)), 0.0012, 60), 'glow_stock_top_' + s);
+    gl(tube(new THREE.QuadraticBezierCurve3(v3(-0.4, -0.114, z * 0.0235), v3(-0.27, -0.068, z * 0.0235), v3(-0.18, -0.04, z * 0.0235)), 0.0012, 60), 'glow_stock_bottom_' + s);
+    gl(new THREE.TorusGeometry(0.0385, 0.0011, 8, 128), 'glow_core_ring_' + s, [-0.325, -0.05, z * 0.0235]);
+    const pts = []; for (let k = 0; k <= 30; k++) { const t = 0.06 + 0.42 * k / 30; pts.push(v3(0.5 - 0.384 * Math.cos(t), -0.03 - 0.384 * Math.sin(t), z * 0.0188)); }
+    gl(tube(new THREE.CatmullRomCurve3(pts), 0.0011, 60), 'glow_magazine_' + s, [0, 0, 0], [0, 0, 0], true);
+    gl(tube(new THREE.LineCurve3(v3(-0.052, -0.045, z * 0.0105), v3(-0.0775, -0.131, z * 0.0105)), 0.001, 20), 'glow_grip_' + s);
+  });
+  for (let i = 0; i < 4; i++) gl(new THREE.TorusGeometry(0.0123, 0.0013, 8, 64), 'glow_barrel_ring_' + (i + 1), [0.5 + i * 0.04, 0, 0], [0, PI / 2, 0]);
+  gl(tube(new THREE.LineCurve3(v3(-0.04, 0.0585, 0.0125), v3(0.115, 0.0585, 0.0125)), 0.0009, 30), 'glow_rail_R');
+  gl(tube(new THREE.LineCurve3(v3(-0.04, 0.0585, -0.0125), v3(0.115, 0.0585, -0.0125)), 0.0009, 30), 'glow_rail_L');
+  return out;
+}
+
 export class Weapon {
   constructor(viewScene, viewCam, callbacks = {}) {
     this.cb = callbacks;
@@ -64,7 +139,7 @@ export class Weapon {
     this.armGroup = new THREE.Group(); this.rig.add(this.armGroup);
 
     // gameplay state
-    this.mag = TUNE.magSize; this.cooldown = 0; this.reloading = false; this.reloadT = 0;
+    this.mag = TUNE.magSize; this.reserve = TUNE.reserveStart; this.recoilMul = 1; this.cooldown = 0; this.reloading = false; this.reloadT = 0;
     this.shots = 0; this.loaded = false;
 
     // animation state
@@ -75,9 +150,10 @@ export class Weapon {
     this.bolt = new Spring(900, 42);
     this.land = new Spring(120, 12);
     this.flashT = 0;
-    this.adsPos = new THREE.Vector3(0, -0.2, -0.36);
+    this.adsPos = new THREE.Vector3(0, -0.2, -0.36); this.adsQuat = new THREE.Quaternion();
     this.magBase = new THREE.Vector3(); this.leftBase = new THREE.Vector3(); this.leftToMag = new THREE.Vector3();
     this.reloadEvents = { out: false, in: false, bolt: false };
+    this.uT = { value: 0 };                // shader clock (seconds)
 
     this.rig.position.copy(TUNE.hip);
     this.flashLight = new THREE.PointLight(0xffc070, 0, 2.5, 2);
@@ -93,6 +169,17 @@ export class Weapon {
     model.scale.setScalar(S);
     model.traverse(o => { if (o.isMesh) { o.frustumCulled = false; o.castShadow = false; if (o.material) o.material.envMapIntensity = 1.35; } });
     this.gun.add(model);
+
+    // animated rainbow parts: patch the material + bake model-space positions (before anything gets re-parented)
+    const va = model.getObjectByName('Verity_A') || model;
+    model.updateMatrixWorld(true);
+    const vaInv = new THREE.Matrix4().copy(va.matrixWorld).invert(), rel = new THREE.Matrix4();
+    model.traverse(o => {
+      if (o.isMesh && o.material && o.material.name === 'rainbow_anodized') {
+        patchMat(o.material, 'rainbow', this.uT);
+        bakeLocalPos(o, rel.multiplyMatrices(vaInv, o.matrixWorld));
+      }
+    });
 
     // measure everything while rig/gun are at identity so Box3 == rig space
     this.rig.position.set(0, 0, 0); this.rig.rotation.set(0, 0, 0);
@@ -126,6 +213,7 @@ export class Weapon {
     // movable sub-assemblies
     const parent = named('Verity_A') || model;
     this.magGroup = new THREE.Group(); parent.add(this.magGroup);
+    for (const { mesh, mag } of buildGlowLines(this.uT)) (mag ? this.magGroup : parent).add(mesh);      // pulsing glow lines
     model.traverse(o => { if (o.name && /^magazine/.test(o.name) && o.name !== 'magazine_catch') this._mags = (this._mags || []).concat(o); });
     (this._mags || []).forEach(o => this.magGroup.attach(o));
     this.boltGroup = new THREE.Group(); parent.add(this.boltGroup);
@@ -142,9 +230,22 @@ export class Weapon {
     cone.rotation.x = -Math.PI / 2; cone.position.z = -0.08; this.flash.add(cone);
     this.flashCone = cone;
 
-    // ADS pose: gun centred, its top edge just under the crosshair
-    const cx = (wholeB.min.x + wholeB.max.x) / 2;
-    this.adsPos.set(-cx, TUNE.adsTopOffset - wholeB.max.y, TUNE.adsZ);
+    // ADS pose: line the rear aperture and the front sight post up exactly on the camera axis.
+    // Find the two sight points (gun space), rotate so the line between them points straight down -Z,
+    // then slide the gun so the aperture sits `adsRelief` in front of the eye on x = y = 0.
+    const rearB = first('aperture_ring', 'aperture_stem', 'rear_sight_block');
+    const frontB = first('front_sight_tritium', 'front_sight_post', 'front_sight_tower');
+    this.adsQuat = new THREE.Quaternion();
+    if (rearB && frontB) {
+      const A = rearB.getCenter(new THREE.Vector3()), F = frontB.getCenter(new THREE.Vector3());
+      this.adsQuat.setFromUnitVectors(F.clone().sub(A).normalize(), new THREE.Vector3(0, 0, -1));
+      const Ar = A.clone().applyQuaternion(this.adsQuat);
+      this.adsPos.set(-Ar.x, -Ar.y - TUNE.adsDrop, -TUNE.adsRelief - Ar.z);
+      this.sights = { rear: A, front: F };
+    } else {                                   // fallback: centre the top of the gun under the crosshair
+      const cx = (wholeB.min.x + wholeB.max.x) / 2;
+      this.adsPos.set(-cx, -0.03 - wholeB.max.y, -0.36);
+    }
 
     // reload geometry
     const mc = magB.getCenter(new THREE.Vector3());
@@ -258,7 +359,7 @@ export class Weapon {
   /** Call when a shot actually leaves the barrel. */
   fire() {
     this.mag--; this.cooldown = 1 / TUNE.fireRate; this.shots++;
-    const aim = 1 - 0.45 * this.aimB;
+    const aim = (1 - 0.45 * this.aimB) * this.recoilMul;
     this.rec.z.v += rnd(0.55, 0.8) * aim;
     this.rec.y.v += rnd(0.05, 0.2) * aim;
     this.rec.rx.v += rnd(1.0, 1.5) * aim;
@@ -274,7 +375,7 @@ export class Weapon {
     }
   }
   startReload() {
-    if (!this.loaded || this.reloading || this.mag >= TUNE.magSize) return false;
+    if (!this.loaded || this.reloading || this.mag >= TUNE.magSize || this.reserve <= 0) return false;
     this.reloading = true; this.reloadT = 0; this.reloadEvents = { out: false, in: false, bolt: false };
     this.cb.onReloadStart && this.cb.onReloadStart();
     return true;
@@ -285,7 +386,7 @@ export class Weapon {
   /* ---------------------------- animation -------------------------- */
   update(dt, s) {
     if (!this.loaded) return;
-    this.time += dt; this.cooldown = Math.max(0, this.cooldown - dt);
+    this.time += dt; this.uT.value = this.time; this.cooldown = Math.max(0, this.cooldown - dt);
     const speed = s.speed;                                  // horizontal m/s
     const moving = s.grounded && speed > 0.6;
 
@@ -296,7 +397,7 @@ export class Weapon {
     if (moving) this.bobPhase += dt * speed * (s.sprint ? 1.5 : 1.65);
 
     const w = this.walkB, sp = this.sprintB, aim = this.aimB, ph = this.bobPhase, T = this.time;
-    const calm = 1 - 0.75 * aim;
+    const calm = 1 - 0.92 * aim;                       // sights stay rock steady while aiming
 
     // --- procedural locomotion ---
     let px = (Math.sin(ph) * 0.011 * w + Math.sin(ph) * 0.028 * sp) * calm;
@@ -317,19 +418,24 @@ export class Weapon {
     const idt = 1 / Math.max(dt, 0.004);               // mouse px / second, so sway is frame-rate independent
     this.swayX = damp(this.swayX, clamp(-s.lookX * idt * 0.0000117, -0.05, 0.05), 11, dt);
     this.swayY = damp(this.swayY, clamp(-s.lookY * idt * 0.0000117, -0.04, 0.04), 11, dt);
-    ry += this.swayX * 0.9; px += this.swayX * 0.35;
-    rx += this.swayY * 0.9; py += this.swayY * 0.35;
+    const sw = 1 - 0.85 * aim;
+    ry += this.swayX * 0.9 * sw; px += this.swayX * 0.35 * sw;
+    rx += this.swayY * 0.9 * sw; py += this.swayY * 0.35 * sw;
 
     // --- jump / fall / landing ---
     if (s.landed) this.land.v -= clamp(s.landed, 0, 14) * 0.5;
     this.land.step(dt);
-    py += clamp(-s.vy * 0.0035, -0.03, 0.03) * this.airB + this.land.x * 0.02;
-    rx += clamp(s.vy * 0.004, -0.05, 0.05) * this.airB;
+    py += (clamp(-s.vy * 0.0035, -0.03, 0.03) * this.airB + this.land.x * 0.02) * calm;
+    rx += clamp(s.vy * 0.004, -0.05, 0.05) * this.airB * calm;
 
     // --- recoil (springs) ---
     for (const k in this.rec) this.rec[k].step(dt);
     this.bolt.step(dt);
     pz += this.rec.z.x; py += this.rec.y.x; rx += this.rec.rx.x; ry += this.rec.ry.x; rz += this.rec.rz.x;
+
+    // --- slide pose: gun drops and cants to the side while the body skids along the floor ---
+    const sl = clamp(s.slide || 0, 0, 1) * (1 - aim);
+    px += 0.03 * sl; py -= 0.05 * sl; pz += 0.02 * sl; rx -= 0.16 * sl; ry += 0.42 * sl; rz += 0.24 * sl;
 
     // --- sprint pose / ADS blend ---
     const hip = TUNE.hip, ads = this.adsPos, sprintP = TUNE.sprintPos, sprintR = TUNE.sprintRot;
@@ -337,7 +443,9 @@ export class Weapon {
     const baseY = THREE.MathUtils.lerp(hip.y, ads.y, aim) + sprintP.y * sp;
     const baseZ = THREE.MathUtils.lerp(hip.z, ads.z, aim) + sprintP.z * sp;
     this.rig.position.set(baseX + px, baseY + py, baseZ + pz);
-    this.rig.rotation.set(rx + sprintR.x * sp, ry + sprintR.y * sp, rz + sprintR.z * sp);
+    _e.set(rx + sprintR.x * sp, ry + sprintR.y * sp, rz + sprintR.z * sp);
+    _qBase.identity().slerp(this.adsQuat, aim);                  // sight-alignment rotation (identity at the hip)
+    this.rig.quaternion.setFromEuler(_e).multiply(_qBase);       // animation offsets are applied on top
 
     // --- reload ---
     let tilt = 0, magOff = 0, magVisible = true;
@@ -359,9 +467,9 @@ export class Weapon {
       if (t > 0.45 && !this.reloadEvents.out) { this.reloadEvents.out = true; this.cb.onMagOut && this.cb.onMagOut(); }
       if (t > 0.84 && !this.reloadEvents.in) { this.reloadEvents.in = true; this.cb.onMagIn && this.cb.onMagIn(); }
       if (t > 0.93 && !this.reloadEvents.bolt) { this.reloadEvents.bolt = true; this.bolt.v += -3.2; this.cb.onBolt && this.cb.onBolt(); }
-      if (t >= 1) { this.reloading = false; this.mag = TUNE.magSize; this.cb.onReloadEnd && this.cb.onReloadEnd(); }
+      if (t >= 1) { this.reloading = false; const take = Math.min(TUNE.magSize - this.mag, this.reserve); this.mag += take; this.reserve -= take; this.cb.onReloadEnd && this.cb.onReloadEnd(); }
     }
-    this.gun.rotation.set(tilt * 0.22, -tilt * 0.12, tilt * 0.42);
+    this.gun.rotation.set(tilt * 0.22, tilt * 0.12, -tilt * 0.42);   // tilts to the LEFT so both hands and the mag are visible
     this.gun.position.set(0, -tilt * 0.015, tilt * 0.02);
     this.lh.position.copy(lOff);
     if (this.magGroup) { this.magGroup.visible = magVisible; this.magGroup.position.set(0, magOff / TUNE.scale, 0); }

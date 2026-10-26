@@ -19,14 +19,33 @@
 <div id="hud">
   <div id="lowhp"></div>
   <div id="vignette"></div>
+  <div id="killflash"></div>
   <div id="crosshair"><i></i><i></i><i></i><i></i><b></b></div>
   <div id="hitmarker"><i></i><i></i><i></i><i></i></div>
   <div class="panel" id="wave"><div class="n">WAVE 1</div><div class="s">FALSITY LEFT: 0</div></div>
+  <div class="panel" id="credits"><span class="ic">◆</span> <span class="n">0</span> <small>TRUTH</small></div>
+  <div id="stationhud"><div id="stArrow">▲</div><div id="stTxt">SUPPLY STATION</div></div>
+  <div id="prompt"><kbd>F</kbd> OPEN SUPPLY STATION</div>
+  <div id="discover"></div>
   <div class="panel" id="score"><div class="n">0</div><div class="c"></div></div>
   <div class="panel" id="health"><div class="lbl">INTEGRITY</div><div class="bar"><div class="fill"></div></div></div>
   <div class="panel" id="ammo"><div class="n">30<small> / ∞</small></div><div class="s">VERITY-A</div></div>
   <div id="banner"></div>
   <div id="reloadtxt">RELOADING</div>
+</div>
+
+<div id="shop">
+  <div class="shopbox">
+    <div class="shophead"><div><h2>SUPPLY STATION</h2><small>Spend TRUTH on ammo and upgrades - the fight is paused while you shop.</small></div><div class="bal">◆ <b id="shopCr">0</b></div></div>
+    <div class="shopbody">
+      <div class="col">
+        <h3>SUPPLIES</h3><div id="shopSupplies"></div>
+        <h3>LOADOUT</h3><div id="shopStats" class="stats"></div>
+      </div>
+      <div class="col wide"><h3>WEAPON UPGRADES - VERITY-A</h3><div id="shopUpgrades"></div></div>
+    </div>
+    <div class="shopfoot"><span><kbd>F</kbd> / <kbd>ESC</kbd> back to the fight</span><button id="shopClose">BACK TO FIGHT</button></div>
+  </div>
 </div>
 
 <div id="overlay">
@@ -37,9 +56,11 @@
     <b>W A S D</b><span>Move</span>
     <b>SHIFT</b><span>Sprint (while moving forward)</span>
     <b>SPACE</b><span>Jump</span>
+    <b>C / CTRL</b><span>Slide (while moving) - cancel with SPACE, SHIFT or C</span>
     <b>MOUSE / HOLD LMB</b><span>Look / Fire (full-auto)</span>
-    <b>RMB</b><span>Aim down sights</span>
-    <b>R</b><span>Reload</span>
+    <b>RMB / E (hold)</b><span>Aim down sights</span>
+    <b>R</b><span>Reload (spare ammo is limited!)</span>
+    <b>F</b><span>Supply station: buy ammo + weapon upgrades</span>
     <b>ESC</b><span>Pause</span>
   </div>
   <div class="msg" id="msg"></div>
