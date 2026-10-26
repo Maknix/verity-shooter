@@ -11,10 +11,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 export const TUNE = {
   scale: 0.62,                                  // model scale (the .glb is ~1.19 units long -> ~0.74 m)
   viewFov: 37,                                  // viewmodel FOV: independent of (and lower than) the world camera FOV
-  hip: new THREE.Vector3(0.10, -0.13, -0.45),    // grip position in camera space (hip fire)
-  adsDrop: 0.000,                               // ADS fine-tune: lowers the gun this many metres so the sights sit on the screen centre
+  hip: new THREE.Vector3(0.12, -0.13, -0.43),    // grip position in camera space (hip fire)
+  adsDrop: 0.0,                                 // ADS fine-tune: lowers the gun this many metres so the sights sit on the screen centre
   adsRelief: 0.2,                               // distance from eye to the rear aperture while aiming (metres)
-  sprintPos: new THREE.Vector3(0.02, -0.07, 0.03),
+  sprintPos: new THREE.Vector3(0.02, -0.12, 0.03),
   sprintRot: new THREE.Euler(-0.3, 0.75, 0.14),
   fireRate: 11,                                 // rounds / second
   magSize: 30,
@@ -161,6 +161,11 @@ export class Weapon {
   }
 
   /* ---------------------------------------------------------------- */
+  _updateAdsPos() {                            // re-evaluated every frame so TUNE.adsDrop / adsRelief can be tweaked live
+    const Ar = this.adsAnchor; if (!Ar) return;
+    this.adsPos.set(-Ar.x, -Ar.y - TUNE.adsDrop, -TUNE.adsRelief - Ar.z);
+  }
+
   async load(url) {
     const gltf = await new GLTFLoader().loadAsync(url);
     const model = gltf.scene; this.model = model;
@@ -236,16 +241,19 @@ export class Weapon {
     const rearB = first('aperture_ring', 'aperture_stem', 'rear_sight_block');
     const frontB = first('front_sight_tritium', 'front_sight_post', 'front_sight_tower');
     this.adsQuat = new THREE.Quaternion();
-    if (rearB && frontB) {
-      const A = rearB.getCenter(new THREE.Vector3()), F = frontB.getCenter(new THREE.Vector3());
+    this.adsAnchor = new THREE.Vector3();                 // sight point in gun space, after the sight-line rotation
+    if (frontB) {
+      const F = frontB.getCenter(new THREE.Vector3());
+      // models without a rear sight (e.g. a re-exported .glb): treat the sight line as parallel to the barrel (camera -Z)
+      const A = rearB ? rearB.getCenter(new THREE.Vector3()) : F.clone().add(new THREE.Vector3(0, 0, 0.35));
       this.adsQuat.setFromUnitVectors(F.clone().sub(A).normalize(), new THREE.Vector3(0, 0, -1));
-      const Ar = A.clone().applyQuaternion(this.adsQuat);
-      this.adsPos.set(-Ar.x, -Ar.y - TUNE.adsDrop, -TUNE.adsRelief - Ar.z);
+      this.adsAnchor.copy(A).applyQuaternion(this.adsQuat);
       this.sights = { rear: A, front: F };
-    } else {                                   // fallback: centre the top of the gun under the crosshair
+    } else {                                   // last resort: centre the top of the gun under the crosshair
       const cx = (wholeB.min.x + wholeB.max.x) / 2;
-      this.adsPos.set(-cx, -0.03 - wholeB.max.y, -0.36);
+      this.adsAnchor.set(cx, wholeB.max.y, 0);
     }
+    this._updateAdsPos();
 
     // reload geometry
     const mc = magB.getCenter(new THREE.Vector3());
@@ -438,6 +446,7 @@ export class Weapon {
     px += 0.03 * sl; py -= 0.05 * sl; pz += 0.02 * sl; rx -= 0.16 * sl; ry += 0.42 * sl; rz += 0.24 * sl;
 
     // --- sprint pose / ADS blend ---
+    this._updateAdsPos();
     const hip = TUNE.hip, ads = this.adsPos, sprintP = TUNE.sprintPos, sprintR = TUNE.sprintRot;
     const baseX = THREE.MathUtils.lerp(hip.x, ads.x, aim) + sprintP.x * sp;
     const baseY = THREE.MathUtils.lerp(hip.y, ads.y, aim) + sprintP.y * sp;
